@@ -30,3 +30,8 @@
 /.clangd
 /.clang-format
 /src/Temp/
+/.workspace-deps/
+/.workspace-eclipse/
+/.workspace-tools/
+/.workspace-home/
+/.workspace-links/
