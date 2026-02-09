@@ -52,6 +52,7 @@ Implement support for rapid pressure-advance changes (e.g. OrcaSlicer adaptive p
   - Mapping is controlled via each repo's Git remotes (`origin`, optional `fork`), not by folder names.
 - Critical build target clarification (2026-02-09):
   - `RepRapFirmware/FMDC_V03` is not the `TOOL1LC` expansion firmware target.
+  - Local helper script in this repo was renamed to `Scripts/build_duet3mini_fmdc.sh` to avoid 1LC naming confusion.
   - Correct `TOOL1LC` build target lives in `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion` as Eclipse config `TOOL1LC`.
   - Correct 1LC binary path: `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion/TOOL1LC/Duet3Firmware_TOOL1LC.bin`.
 - Duet3Expansion patch status (2026-02-09):

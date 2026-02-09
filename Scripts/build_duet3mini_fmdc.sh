@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build script for:
 # - Duet 3 Mini 5+ main firmware (RepRapFirmware/Duet3Mini5plus)
-# - Duet 1LC expansion firmware (RepRapFirmware/FMDC_V03)
+# - FMDC firmware (RepRapFirmware/FMDC_V03)
 #
 # It assumes this repository is the workspace root and dependency repos exist at:
 #   .workspace-deps/CoreN2G
