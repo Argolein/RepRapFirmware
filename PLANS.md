@@ -46,3 +46,20 @@ Implement support for rapid pressure-advance changes (e.g. OrcaSlicer adaptive p
 - CANlib patch is prepared as commit `727a0dd` on local branch `feature/can-pa-per-move-snapshot` in `/Users/ArgoMac/GitHub-Development/RRF-Build-Helper/rrf-local/deps/CANlib`; pushing to user fork is pending fork remote details.
 - Additional validation done on 2026-02-09: added CAN announce capability bit (`supportsMovementPaSnapshot`) and rebuilt both firmware targets successfully.
 - Additional robustness fix on 2026-02-09: `supportsMovementPaSnapshot` is now refreshed on every announce (not only when board type text changes), avoiding stale capability state.
+- Workspace structure clarification (2026-02-09):
+  - Not every GitHub fork has a top-level folder under `GitHub-Development`.
+  - Active dependency repos are intentionally kept under `../RRF-Build-Helper/rrf-local/deps/`.
+  - Mapping is controlled via each repo's Git remotes (`origin`, optional `fork`), not by folder names.
+- Critical build target clarification (2026-02-09):
+  - `RepRapFirmware/FMDC_V03` is not the `TOOL1LC` expansion firmware target.
+  - Correct `TOOL1LC` build target lives in `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion` as Eclipse config `TOOL1LC`.
+  - Correct 1LC binary path: `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion/TOOL1LC/Duet3Firmware_TOOL1LC.bin`.
+- Duet3Expansion patch status (2026-02-09):
+  - Local repo: `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion`
+  - Commit: `3cedbc98` (`Use per-move PA snapshot for TOOL1LC CAN moves`)
+  - Branch pushed to user fork: `feature/tool1lc-adaptive-pa-snapshot`
+  - Fork URL: `https://github.com/Argolein/Duet3Expansion`
+- Continuation workflow:
+  - Mainboard-side work remains in this repo (`RepRapFirmware`), branch `adaptive-pa` (commit `e5665ed8c`).
+  - Toolboard-side work for 1LC remains in `Duet3Expansion`.
+  - CAN message format changes must remain compatible with pinned CANlib commit in `RRF-Build-Helper/versions.lock`.
