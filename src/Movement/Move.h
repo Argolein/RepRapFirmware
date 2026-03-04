@@ -434,6 +434,11 @@ public:
 
 	unsigned int GetJerkPolicy() const noexcept { return jerkPolicy; }
 	void SetJerkPolicy(unsigned int jp) noexcept { jerkPolicy = jp; }
+	float GetMinimumCruiseRatio() const noexcept { return minimumCruiseRatio; }
+	void SetMinimumCruiseRatio(float ratio) noexcept
+	{
+		minimumCruiseRatio = (ratio < 0.0) ? 0.0 : (ratio > 0.99) ? 0.99 : ratio;
+	}
 
 #if SUPPORT_SCANNING_PROBES
 	void PrepareScanningProbeDataCollection(const DDA& dda, const PrepParams& params) noexcept;
@@ -644,6 +649,7 @@ private:
 	MoveState moveState;								// whether the idle timer is active
 
 	unsigned int jerkPolicy;							// When we allow jerk
+	float minimumCruiseRatio;							// Minimum fraction of each move spent at constant speed
 	unsigned int idleCount;								// The number of times Spin was called and had no new moves to process
 	unsigned int numInterruptHiccups;					// The number of hiccups inserted by the ISR
 	unsigned int numPrepareHiccups;						// The number of hiccups inserted when preparing the move

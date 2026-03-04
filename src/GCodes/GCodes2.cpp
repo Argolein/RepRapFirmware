@@ -3714,6 +3714,11 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 						seenAxis = true;
 						reprap.GetMove().SetJerkPolicy(gb.GetUIValue());
 					}
+					if (code == 566 && gb.Seen('R'))
+					{
+						seenAxis = true;
+						reprap.GetMove().SetMinimumCruiseRatio(gb.GetLimitedFValue('R', 0.0, 0.99));
+					}
 
 					if (seenAxis)
 					{
@@ -3736,7 +3741,8 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 						}
 						if (code == 566)
 						{
-							reply.catf(", jerk policy: %u", reprap.GetMove().GetJerkPolicy());
+							reply.catf(", jerk policy: %u, minimum cruise ratio: %.3f",
+									   reprap.GetMove().GetJerkPolicy(), (double)reprap.GetMove().GetMinimumCruiseRatio());
 						}
 					}
 				}

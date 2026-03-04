@@ -353,10 +353,11 @@ Move::Move() noexcept
 #endif
 	  lastDirChangeTime(0),
 #if SUPPORT_ASYNC_MOVES
-	  heightController(nullptr),
+		  heightController(nullptr),
 #endif
-	  jerkPolicy(0),
-	  numCalibratedFactors(0)
+		  jerkPolicy(0),
+		  minimumCruiseRatio(0.5),
+		  numCalibratedFactors(0)
 {
 #if VARIABLE_NUM_DRIVERS
 	numActualDirectDrivers = NumDirectDrivers;						// assume they are all available until we know otherwise

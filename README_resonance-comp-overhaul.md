@@ -7,6 +7,7 @@ This document summarizes the new motion features and G-code parameters introduce
 - Per-axis input shaping (X/Y) in RepRapFirmware
 - Pressure advance smooth time (seconds, Klipper-compatible unit)
 - Optional Klipper-like corner limiter via `M566 P2`
+- Klipper-like minimum cruise ratio via `M566 R`
 - CAN timing hardening for extruder-only moves
 
 ## New / Extended G-code Behavior
@@ -70,11 +71,19 @@ Compatibility notes:
 The new corner logic is enabled with:
 
 - `M566 P2`
+- `M566 P2 R0.50`
 
 Behavior:
 
 - `P2` (and higher) keeps existing instant-DV logic and adds an additional junction-deviation-like corner speed limiter for XY corners.
 - This is intended to bring corner handling closer to Klipper behavior.
+
+Minimum cruise ratio:
+
+- `R` sets the minimum fraction of move distance that should remain in constant-speed (cruise) phase.
+- Range in this branch: `0.00 .. 0.99`
+- Default in this branch: `0.50` (same default value as Klipper `minimum_cruise_ratio`)
+- Example: `M566 R0.50`
 
 ## CAN / Toolboard Notes
 
@@ -87,7 +96,7 @@ Behavior:
 For CoreXY-style machines with tuned values:
 
 ```gcode
-M566 P2
+M566 P2 R0.50
 M593 X P"zvdd" F49.2 S0.10
 M593 Y P"zvdd" F25.6 S0.10
 M572 D0 S0.03 T0.10

@@ -743,6 +743,28 @@ bool DDA::IsAccelerationMove() const noexcept
 {
 //	if (reprap.Debug(moduleDda)) debugPrintf("Adjusting, %f\n", laDDA->targetNextSpeed);
 	unsigned int laDepth = 0;
+	const float mcrAccelFactor = max<float>(1.0 - reprap.GetMove().GetMinimumCruiseRatio(), 0.0);
+	const auto LimitTargetSpeedForMcr = [mcrAccelFactor](DDA *dda) noexcept
+	{
+		// Keep Klipper-like minimum-cruise behaviour scoped to XY kinematic moves.
+		if (!dda->flags.xyMoving || !dda->next->flags.xyMoving || mcrAccelFactor >= 1.0)
+		{
+			return;
+		}
+
+		const float pseudoAcceleration = dda->maxAcceleration * mcrAccelFactor;
+		if (pseudoAcceleration <= 0.0)
+		{
+			dda->beforePrepare.targetNextSpeed = min<float>(dda->beforePrepare.targetNextSpeed, dda->startSpeed);
+			return;
+		}
+
+		const float maxMcrReachableSpeed = fastSqrtf(fsquare(dda->startSpeed) + (2 * pseudoAcceleration * dda->totalDistance));
+		if (dda->beforePrepare.targetNextSpeed > maxMcrReachableSpeed)
+		{
+			dda->beforePrepare.targetNextSpeed = maxMcrReachableSpeed;
+		}
+	};
 
 	// Iterate through the list towards earlier moves
 	for (;;)
@@ -752,6 +774,7 @@ bool DDA::IsAccelerationMove() const noexcept
 		{
 			laDDA->beforePrepare.targetNextSpeed = laDDA->requestedSpeed;			// don't try for an end speed higher than our requested speed
 		}
+		LimitTargetSpeedForMcr(laDDA);
 		if (laDDA->topSpeed >= laDDA->requestedSpeed)
 		{
 			// This move already reaches its top speed, so we just need to adjust the deceleration part
@@ -772,15 +795,23 @@ bool DDA::IsAccelerationMove() const noexcept
 					   )
 				   )
 			   )
-			{
-				laDDA->MatchSpeeds();
-				const float maxStartSpeed = fastSqrtf(fsquare(laDDA->beforePrepare.targetNextSpeed) + (2 * laDDA->maxDeceleration * laDDA->totalDistance));
-				laDDA->prev->beforePrepare.targetNextSpeed = min<float>(maxStartSpeed, laDDA->requestedSpeed);
+				{
+					laDDA->MatchSpeeds();
+					float maxStartSpeed = fastSqrtf(fsquare(laDDA->beforePrepare.targetNextSpeed) + (2 * laDDA->maxDeceleration * laDDA->totalDistance));
+					if (mcrAccelFactor < 1.0 && laDDA->prev->flags.xyMoving && laDDA->flags.xyMoving)
+					{
+						const float pseudoDeceleration = laDDA->maxDeceleration * mcrAccelFactor;
+						const float mcrStartSpeed = (pseudoDeceleration <= 0.0)
+														? laDDA->beforePrepare.targetNextSpeed
+														: fastSqrtf(fsquare(laDDA->beforePrepare.targetNextSpeed) + (2 * pseudoDeceleration * laDDA->totalDistance));
+						maxStartSpeed = min<float>(maxStartSpeed, mcrStartSpeed);
+					}
+					laDDA->prev->beforePrepare.targetNextSpeed = min<float>(maxStartSpeed, laDDA->requestedSpeed);
 
-				// Still going up
-				laDDA = _ecv_not_null(laDDA->prev);
-				++laDepth;
-				continue;
+					// Still going up
+					laDDA = _ecv_not_null(laDDA->prev);
+					++laDepth;
+					continue;
 			}
 
 			// This move is a deceleration-only move but we can't adjust the previous one
@@ -797,6 +828,7 @@ bool DDA::IsAccelerationMove() const noexcept
 		{
 			laDDA->beforePrepare.targetNextSpeed = maxReachableSpeed;
 		}
+		LimitTargetSpeedForMcr(laDDA);
 		break;
 	}
 
@@ -850,6 +882,7 @@ LA_DEBUG;
 		{
 			laDDA->beforePrepare.targetNextSpeed = maxEndSpeed;
 		}
+		LimitTargetSpeedForMcr(laDDA);
 	}
 }
 
@@ -993,6 +1026,41 @@ MovementError DDA::RecalculateMove(DDARing& ring) noexcept
 			}
 		}
 	}
+
+	// Enforce a minimum cruise distance ratio (Klipper-like minimum_cruise_ratio behaviour).
+	// This limits how much of the move can be spent accelerating/decelerating.
+	if (flags.xyMoving)
+	{
+		const float minCruiseRatio = reprap.GetMove().GetMinimumCruiseRatio();
+		if (minCruiseRatio > 0.0)
+		{
+			const float maxRampDistance = totalDistance * (1.0 - minCruiseRatio);
+			const float invTwoA = 0.5/maxAcceleration;
+			const float invTwoD = 0.5/maxDeceleration;
+			const float denom = invTwoA + invTwoD;
+			if (denom > 0.0)
+			{
+				const float minTopSpeed = max<float>(startSpeed, endSpeed);
+				const float topSpeedSquaredLimit = (maxRampDistance + (fsquare(startSpeed) * invTwoA) + (fsquare(endSpeed) * invTwoD))/denom;
+				if (topSpeedSquaredLimit <= 0.0)
+				{
+					topSpeed = minTopSpeed;
+				}
+				else
+				{
+					const float limitedTopSpeed = max<float>(minTopSpeed, fastSqrtf(topSpeedSquaredLimit));
+					if (topSpeed > limitedTopSpeed)
+					{
+						topSpeed = limitedTopSpeed;
+					}
+				}
+			}
+		}
+	}
+
+	// Keep distances in sync with the final top speed.
+	beforePrepare.accelDistance = max<float>((fsquare(topSpeed) - fsquare(startSpeed))/twoA, 0.0);
+	beforePrepare.decelDistance = max<float>((fsquare(topSpeed) - fsquare(endSpeed))/twoD, 0.0);
 
 	// Set up flags.canPauseAfter
 	if (flags.canPauseAfter && endSpeed != 0.0)
