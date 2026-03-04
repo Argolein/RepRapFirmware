@@ -65,14 +65,16 @@ AxisShaper::AxisShaper() noexcept
 	: type(InputShaperType::none),
 	  frequency(DefaultFrequency),
 	  zeta(DefaultDamping),
-	  numImpulses(1), prepareAdvanceTime(MoveTiming::UsualMinimumPreparedTime)
+	  numImpulses(1),
+	  phaseAdvanceTime(0),
+	  prepareAdvanceTime(MoveTiming::UsualMinimumPreparedTime)
 {
 	coefficients[0] = 1.0;
 	delays[0] = 0;
 }
 
 // Process M593 (configure input shaping)
-GCodeResult AxisShaper::Configure(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException)
+GCodeResult AxisShaper::Configure(GCodeBuffer& gb, const StringRef& reply, bool updateRemote) THROWS(GCodeException)
 {
 	bool seen = false;
 
@@ -255,40 +257,52 @@ GCodeResult AxisShaper::Configure(GCodeBuffer& gb, const StringRef& reply) THROW
 			break;
 		}
 
-		// The sum of the coefficients must total 1, use this to fill in the last coefficient
-		// Also calculate the longest interval between adjacent impulses
+		// The sum of the coefficients must total 1, use this to fill in the last coefficient.
+		// Also compute a phase advance so each move is centred in time (equivalent to shifting pulses around t=0).
 		motioncalc_t sum = 0.0;
-		uint32_t longestSegment = 0;
 		for (size_t i = 0; i + 1 < numImpulses; ++i)
 		{
 			sum += coefficients[i];
-			const uint32_t thisInterval = delays[i + 1] - delays[1];
-			if (thisInterval > longestSegment)
-			{
-				longestSegment = thisInterval;
-			}
 		}
 		coefficients[numImpulses - 1] = (motioncalc_t)1.0 - sum;
-		prepareAdvanceTime = max<uint32_t>(longestSegment + MoveTiming::AbsoluteMinimumPreparedTime, MoveTiming::UsualMinimumPreparedTime);
+
+		motioncalc_t weightedDelay = 0.0;
+		uint32_t maxDelay = 0;
+		for (size_t i = 0; i < numImpulses; ++i)
+		{
+			weightedDelay += coefficients[i] * (motioncalc_t)delays[i];
+			maxDelay = max<uint32_t>(maxDelay, delays[i]);
+		}
+		phaseAdvanceTime = (weightedDelay <= 0.0) ? 0 : (uint32_t)lrintf((float)weightedDelay);
+		if (phaseAdvanceTime > maxDelay)
+		{
+			phaseAdvanceTime = maxDelay;
+		}
+
+		const uint32_t preActive = phaseAdvanceTime;
+		const uint32_t postActive = maxDelay - phaseAdvanceTime;
+		prepareAdvanceTime = max<uint32_t>(max(preActive, postActive) + MoveTiming::AbsoluteMinimumPreparedTime, MoveTiming::UsualMinimumPreparedTime);
 
 		reprap.MoveUpdated();
 
 #if SUPPORT_CAN_EXPANSION
-# if USE_DOUBLE_MOTIONCALC
+		if (updateRemote)
 		{
-			float fCoefficients[MaxImpulses];
-			for (size_t i = 0; i < numImpulses; ++i)
+# if USE_DOUBLE_MOTIONCALC
 			{
-				fCoefficients[i] = (float)coefficients[i];
+				float fCoefficients[MaxImpulses];
+				for (size_t i = 0; i < numImpulses; ++i)
+				{
+					fCoefficients[i] = (float)coefficients[i];
+				}
+				return reprap.GetMove().UpdateRemoteInputShaping(numImpulses, fCoefficients, delays, reply);
 			}
-			return reprap.GetMove().UpdateRemoteInputShaping(numImpulses, fCoefficients, delays, reply);
-		}
 # else
-		return UpdateRemoteInputShaping(reply);
+			return UpdateRemoteInputShaping(reply);
 # endif
-#else
-		// Fall through to return GCodeResult::ok
+		}
 #endif
+		// Fall through to return GCodeResult::ok
 	}
 	else if (type == InputShaperType::none)
 	{

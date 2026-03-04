@@ -3897,7 +3897,7 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 #endif
 
 			case 593: // Configure dynamic ringing cancellation
-				result = reprap.GetMove().GetAxisShaper().Configure(gb, reply);
+				result = reprap.GetMove().ConfigureInputShaping(gb, reply);
 				break;
 
 #if SUPPORT_ASYNC_MOVES

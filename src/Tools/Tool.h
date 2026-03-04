@@ -147,6 +147,8 @@ public:
 	void StopExtrusionFeedForward() const noexcept;
 	float GetPressureAdvance() const noexcept { return pressureAdvance; }
 	void SetPressureAdvance(float pa) noexcept { pressureAdvance = pa; }
+	float GetPressureAdvanceSmoothTime() const noexcept { return pressureAdvanceSmoothTime; }
+	void SetPressureAdvanceSmoothTime(float st) noexcept { pressureAdvanceSmoothTime = st; }
 
 	void Activate() noexcept;
 	void Standby() noexcept;
@@ -191,6 +193,7 @@ private:
 	float heaterFeedForwardTemp[MaxHeatersPerTool];
 	uint32_t feedForwardAdvanceClocks = 0;
 	float pressureAdvance = 0.0;
+	float pressureAdvanceSmoothTime = 0.0;
 
 	// Firmware retraction settings
 	float retractLength, retractExtra;			// retraction length and extra length to un-retract

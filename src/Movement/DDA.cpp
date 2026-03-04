@@ -123,6 +123,22 @@ inline uint32_t floatToU32(float f) noexcept
 	return (std::signbit(f)) ? 0 : (uint32_t)f;
 }
 
+// Apply a simple time-domain PA smoothing approximation for targets that only accept a single PA value (e.g. CAN remotes):
+// for short accel/decel phases, reduce PA proportionally to phase duration.
+inline float GetSmoothedPressureAdvanceClocks(float pressureAdvanceClocks, float smoothTimeClocks, uint32_t phaseClocks) noexcept
+{
+	if (pressureAdvanceClocks <= 0.0 || phaseClocks == 0)
+	{
+		return 0.0;
+	}
+	if (smoothTimeClocks <= 0.0)
+	{
+		return pressureAdvanceClocks;
+	}
+	const float factor = min<float>((float)phaseClocks/smoothTimeClocks, 1.0);
+	return pressureAdvanceClocks * factor;
+}
+
 // Set up the parameters from the DDA, excluding steadyClocks because that may be affected by input shaping
 void PrepParams::SetFromDDA(const DDA& dda) noexcept
 {
@@ -171,6 +187,7 @@ DDA::DDA(DDA *_ecv_null n) noexcept : next(n), prev(nullptr)
 	flags.all = 0;						// in particular we need to set endCoordinatesValid, usePressureAdvance to false, stateBits to empty, also checkEndstops false for the ATE build
 	SetState(empty);					// should alrrady be covered by the above
 	pressureAdvanceClocks = 0.0;
+	pressureAdvanceSmoothClocks = 0.0;
 	virtualExtruderPosition = 0.0;
 	filePos = noFilePosition;
 
@@ -419,6 +436,7 @@ MovementError DDA::InitStandardMove(DDARing& ring, const RawMove &nextMove, bool
 	initialUserC1 = nextMove.initialUserC1;
 	originalFeedRate = nextMove.originalFeedRate;
 	pressureAdvanceClocks = (nextMove.usePressureAdvance) ? (float)nextMove.pressureAdvance * (float)StepClockRate : 0.0;
+	pressureAdvanceSmoothClocks = (nextMove.usePressureAdvance) ? (float)nextMove.pressureAdvanceSmoothTime * (float)StepClockRate : 0.0;
 
 	// These 4 or 5 bits can be copied in one go by the compiler generating a ubfx instruction
 	flags.canPauseAfter = nextMove.canPauseAfter;
@@ -1016,6 +1034,51 @@ void DDA::MatchSpeeds() noexcept
 			}
 		}
 	}
+
+	// Optional Klipper-style corner limiter (enabled via M566 P2+).
+	// This augments the classic instant-DV limit with a junction-deviation-like speed bound for XY corners.
+	if (reprap.GetMove().GetJerkPolicy() >= 2
+		&& flags.xyMoving
+		&& next->flags.xyMoving
+		&& reprap.GetGCodes().GetTotalAxes() > Y_AXIS)
+	{
+		float cx = directionVector[X_AXIS], cy = directionVector[Y_AXIS];
+		float nx = next->directionVector[X_AXIS], ny = next->directionVector[Y_AXIS];
+		const float cLenSq = fsquare(cx) + fsquare(cy);
+		const float nLenSq = fsquare(nx) + fsquare(ny);
+		if (cLenSq > 0.0 && nLenSq > 0.0)
+		{
+			const float invCLen = 1.0/fastSqrtf(cLenSq);
+			const float invNLen = 1.0/fastSqrtf(nLenSq);
+			cx *= invCLen; cy *= invCLen;
+			nx *= invNLen; ny *= invNLen;
+
+			float junctionCosTheta = -(cx * nx + cy * ny);
+			junctionCosTheta = constrain<float>(junctionCosTheta, -1.0, 1.0);
+			const float sinThetaD2 = fastSqrtf(max<float>(0.5f * (1.0f - junctionCosTheta), 0.0f));
+			const float cosThetaD2 = fastSqrtf(max<float>(0.5f * (1.0f + junctionCosTheta), 0.0f));
+			const float oneMinusSinThetaD2 = 1.0f - sinThetaD2;
+			if (oneMinusSinThetaD2 > 0.0 && cosThetaD2 > 0.0)
+			{
+				const float accel = min<float>(maxAcceleration, next->maxAcceleration);
+				if (accel > 0.0)
+				{
+					const float scv = min<float>(reprap.GetMove().GetPrintingInstantDv(X_AXIS), reprap.GetMove().GetPrintingInstantDv(Y_AXIS));
+					const float junctionDeviation = (fsquare(scv) * (fastSqrtf(2.0f) - 1.0f))/accel;
+					const float rJd = sinThetaD2/oneMinusSinThetaD2;
+					const float jdV2 = rJd * junctionDeviation * accel;
+					const float quarterTanThetaD2 = 0.25f * sinThetaD2/cosThetaD2;
+					const float thisCentripetalV2 = 2.0f * totalDistance * accel * quarterTanThetaD2;
+					const float nextCentripetalV2 = 2.0f * next->totalDistance * accel * quarterTanThetaD2;
+					const float maxJunctionV2 = min<float>(jdV2, min<float>(thisCentripetalV2, nextCentripetalV2));
+					if (maxJunctionV2 > 0.0)
+					{
+						beforePrepare.targetNextSpeed = min<float>(beforePrepare.targetNextSpeed, fastSqrtf(maxJunctionV2));
+					}
+				}
+			}
+		}
+	}
 }
 
 // Force an end point. Called when a homing switch is triggered.
@@ -1093,6 +1156,91 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 		segFlags.checkEndstops = flags.checkEndstops;
 		segFlags.noShaping = !params.useInputShaping;
 		segFlags.nonPrintingMove = !flags.isPrintingMove;
+		const size_t totalAxes = reprap.GetGCodes().GetTotalAxes();
+		const size_t visibleAxes = reprap.GetGCodes().GetVisibleAxes();
+		bool hasRemoteAxisDrivers = false;
+#if SUPPORT_CAN_EXPANSION
+		// Only check X and Y: per-axis shaping splits motion in Cartesian X/Y space.
+		// Remote drivers on other axes (e.g. CAN Z) do not affect XY shaping semantics.
+		for (size_t axis = X_AXIS; axis <= Y_AXIS && axis < totalAxes; ++axis)
+		{
+			const AxisDriversConfig& config = move.GetAxisDriversConfig(axis);
+			for (size_t i = 0; i < config.numDrivers; ++i)
+			{
+				if (config.driverNumbers[i].IsRemote())
+				{
+					hasRemoteAxisDrivers = true;
+					break;
+				}
+			}
+			if (hasRemoteAxisDrivers)
+			{
+				break;
+			}
+		}
+#endif
+
+		// For kinematics with shared motors (e.g. CoreXY), apply X and Y shapers in Cartesian space, then map each contribution to motor space.
+		// This preserves per-axis shaping semantics even when a motor is driven by both X and Y axes.
+		motioncalc_t xAxisDriveSteps[MaxAxes];
+		motioncalc_t yAxisDriveSteps[MaxAxes];
+		for (size_t axis = 0; axis < MaxAxes; ++axis)
+		{
+			xAxisDriveSteps[axis] = yAxisDriveSteps[axis] = (motioncalc_t)0.0;
+		}
+
+		const KinematicsType kinType = move.GetKinematics().GetKinematicsType();
+		const bool supportsAxisToDriveConversion = kinType == KinematicsType::cartesian
+												|| kinType == KinematicsType::coreXY
+												|| kinType == KinematicsType::coreXZ
+												|| kinType == KinematicsType::coreXYU
+												|| kinType == KinematicsType::coreXYUV
+												|| kinType == KinematicsType::markForged;
+		const bool splitXyShapingByDrive = params.useInputShaping && flags.xyMoving && totalAxes > Y_AXIS && supportsAxisToDriveConversion && !hasRemoteAxisDrivers;
+		const uint32_t xPhaseAdvance = move.GetAxisShaperForAxis(X_AXIS).GetPhaseAdvanceTime();
+		const uint32_t yPhaseAdvance = move.GetAxisShaperForAxis(Y_AXIS).GetPhaseAdvanceTime();
+		const uint32_t xStartTime = afterPrepare.moveStartTime - xPhaseAdvance;
+		const uint32_t yStartTime = afterPrepare.moveStartTime - yPhaseAdvance;
+		uint32_t extrusionPhaseAdvance = 0;
+		if (params.useInputShaping && flags.xyMoving && totalAxes > Y_AXIS && !hasRemoteAxisDrivers)
+		{
+			const motioncalc_t xWeight = (directionVector[X_AXIS] >= 0.0) ? directionVector[X_AXIS] : -directionVector[X_AXIS];
+			const motioncalc_t yWeight = (directionVector[Y_AXIS] >= 0.0) ? directionVector[Y_AXIS] : -directionVector[Y_AXIS];
+			const motioncalc_t totalWeight = xWeight + yWeight;
+			if (totalWeight > 0.0)
+			{
+				const motioncalc_t weightedPhaseAdvance = ((motioncalc_t)xPhaseAdvance * xWeight + (motioncalc_t)yPhaseAdvance * yWeight)/totalWeight;
+				const int32_t roundedPhase = lrintf((float)weightedPhaseAdvance);
+				extrusionPhaseAdvance = (roundedPhase > 0) ? (uint32_t)roundedPhase : 0;
+			}
+		}
+		const uint32_t extrusionStartTime = afterPrepare.moveStartTime - extrusionPhaseAdvance;
+		if (splitXyShapingByDrive)
+		{
+			float driveMovements[MaxAxes];
+			for (float& movement : driveMovements)
+			{
+				movement = 0.0;
+			}
+			driveMovements[X_AXIS] = totalDistance * directionVector[X_AXIS];
+			move.GetKinematics().ConvertAxisAmountsToLogicalDriveAmounts(driveMovements, visibleAxes, totalAxes);
+			for (size_t axis = 0; axis < totalAxes; ++axis)
+			{
+				xAxisDriveSteps[axis] = (motioncalc_t)driveMovements[axis] * move.DriveStepsPerMm(axis);
+			}
+
+			for (float& movement : driveMovements)
+			{
+				movement = 0.0;
+			}
+			driveMovements[Y_AXIS] = totalDistance * directionVector[Y_AXIS];
+			move.GetKinematics().ConvertAxisAmountsToLogicalDriveAmounts(driveMovements, visibleAxes, totalAxes);
+			for (size_t axis = 0; axis < totalAxes; ++axis)
+			{
+				yAxisDriveSteps[axis] = (motioncalc_t)driveMovements[axis] * move.DriveStepsPerMm(axis);
+			}
+		}
+
 		for (size_t drive = 0; drive < MaxAxesPlusExtruders; ++drive)
 		{
 			if (flags.isLeadscrewAdjustmentMove)
@@ -1114,7 +1262,7 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 						else		// we don't generate segments for leadscrew adjustment moves to remote drivers
 #endif
 						{
-							move.AddLinearSegments(driver.localDriver + MaxAxesPlusExtruders, afterPrepare.moveStartTime, params, (motioncalc_t)delta, segFlags, 0.0);
+								move.AddLinearSegments(driver.localDriver + MaxAxesPlusExtruders, afterPrepare.moveStartTime, params, (motioncalc_t)delta, segFlags, move.GetAxisShaper(), 0.0, 0.0, 0.0);
 						}
 					}
 				}
@@ -1124,7 +1272,7 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 			if (ownedDrives.IsBitSet(drive))
 #endif
 			{
-				if (drive < reprap.GetGCodes().GetTotalAxes())
+				if (drive < totalAxes)
 				{
 					// It's a linear axis
 					int32_t delta = endPoint[drive] - prev->endPoint[drive];
@@ -1148,7 +1296,61 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 						delta = move.ApplyBacklashCompensation(drive, delta);
 
 						// We generate segments even for nonlocal drivers so that the final position is correct and to track the position in near real time
-						move.AddLinearSegments(drive, afterPrepare.moveStartTime, params, (motioncalc_t)delta, segFlags, 0.0);
+						if (splitXyShapingByDrive)
+						{
+							motioncalc_t xSteps = xAxisDriveSteps[drive];
+							motioncalc_t ySteps = yAxisDriveSteps[drive];
+							if (xSteps != 0.0 || ySteps != 0.0)
+							{
+								const motioncalc_t correction = (motioncalc_t)delta - xSteps - ySteps;
+								if (correction != 0.0)
+								{
+									const motioncalc_t absX = (xSteps >= 0.0) ? xSteps : -xSteps;
+									const motioncalc_t absY = (ySteps >= 0.0) ? ySteps : -ySteps;
+									if (absX >= absY)
+									{
+										xSteps += correction;
+									}
+									else
+									{
+										ySteps += correction;
+									}
+								}
+
+								if (xSteps != 0.0)
+								{
+									if (ySteps != 0.0 && (int32_t)(xStartTime - yStartTime) > 0)
+									{
+										move.AddLinearSegments(drive, yStartTime, params, ySteps, segFlags, move.GetAxisShaperForAxis(Y_AXIS), 0.0, 0.0, 0.0);
+										move.AddLinearSegments(drive, xStartTime, params, xSteps, segFlags, move.GetAxisShaperForAxis(X_AXIS), 0.0, 0.0, 0.0);
+									}
+									else
+									{
+										move.AddLinearSegments(drive, xStartTime, params, xSteps, segFlags, move.GetAxisShaperForAxis(X_AXIS), 0.0, 0.0, 0.0);
+										if (ySteps != 0.0)
+										{
+											move.AddLinearSegments(drive, yStartTime, params, ySteps, segFlags, move.GetAxisShaperForAxis(Y_AXIS), 0.0, 0.0, 0.0);
+										}
+									}
+								}
+								else if (ySteps != 0.0)
+								{
+									move.AddLinearSegments(drive, yStartTime, params, ySteps, segFlags, move.GetAxisShaperForAxis(Y_AXIS), 0.0, 0.0, 0.0);
+								}
+							}
+							else
+							{
+								const AxisShaper& shaper = move.GetAxisShaperForAxis(drive);
+								const uint32_t axisStartTime = afterPrepare.moveStartTime - shaper.GetPhaseAdvanceTime();
+									move.AddLinearSegments(drive, axisStartTime, params, (motioncalc_t)delta, segFlags, shaper, 0.0, 0.0, 0.0);
+							}
+						}
+						else
+						{
+							const AxisShaper& shaper = move.GetAxisShaperForAxis(drive);
+							const uint32_t axisStartTime = (segFlags.noShaping || hasRemoteAxisDrivers) ? afterPrepare.moveStartTime : (afterPrepare.moveStartTime - shaper.GetPhaseAdvanceTime());
+							move.AddLinearSegments(drive, axisStartTime, params, (motioncalc_t)delta, segFlags, shaper, 0.0, 0.0, 0.0);
+						}
 						afterPrepare.drivesMoving.SetBit(drive);
 
 #if SUPPORT_CAN_EXPANSION
@@ -1198,16 +1400,40 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 #endif
 
 							const motioncalc_t delta = totalDistance * directionVector[drive] * move.DriveStepsPerMm(drive);
-
-							// We generate segments even for nonlocal extruders in order to track extruder position
-							move.AddLinearSegments(drive, afterPrepare.moveStartTime, params, delta, segFlags.AddIsExtruder(), pressureAdvanceClocks);
+							const float accelPressureAdvanceClocks = (flags.usePressureAdvance) ? pressureAdvanceClocks : 0.0;
+							const float decelPressureAdvanceClocks = (flags.usePressureAdvance) ? pressureAdvanceClocks : 0.0;
+							float canPressureAdvanceClocks = 0.0;
+							if (flags.usePressureAdvance)
+							{
+								const float accelSmoothedPa = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.accelClocks);
+								const float decelSmoothedPa = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.decelClocks);
+								const uint32_t paClocks = params.accelClocks + params.decelClocks;
+								if (paClocks != 0)
+								{
+									canPressureAdvanceClocks = ((accelSmoothedPa * (float)params.accelClocks) + (decelSmoothedPa * (float)params.decelClocks))/(float)paClocks;
+								}
+							}
+							MovementFlags extruderFlags = segFlags.AddIsExtruder();
 
 #if SUPPORT_CAN_EXPANSION
 							const DriverId driver = move.GetExtruderDriver(extruder);
 							if (driver.IsRemote())
 							{
+								// A remote tool board has a single legacy shaper, which cannot track per-axis X/Y shaping on the main board.
+								// Keep remote extruder motion unshaped to avoid flow modulation artefacts.
+								extruderFlags.noShaping = true;
+							}
+#endif
+
+							// We generate segments even for nonlocal extruders in order to track extruder position
+							move.AddLinearSegments(drive, extrusionStartTime, params, delta, extruderFlags, move.GetAxisShaper(),
+													accelPressureAdvanceClocks, decelPressureAdvanceClocks, pressureAdvanceSmoothClocks);
+
+#if SUPPORT_CAN_EXPANSION
+							if (driver.IsRemote())
+							{
 								// The MovementLinearShaped message requires the extrusion amount in steps to be passed as a float. The remote board adds the PA and handles fractional steps.
-								CanMotion::AddExtruderMovement(params, driver, delta, flags.usePressureAdvance ? pressureAdvanceClocks : 0.0);
+								CanMotion::AddExtruderMovement(params, driver, delta, canPressureAdvanceClocks);
 							}
 #endif
 							afterPrepare.drivesMoving.SetBit(drive);
@@ -1246,7 +1472,7 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 		}
 
 #if SUPPORT_CAN_EXPANSION
-		const uint32_t canClocksNeeded = CanMotion::FinishMovement(*this, afterPrepare.moveStartTime, simMode != SimulationMode::off);
+			const uint32_t canClocksNeeded = CanMotion::FinishMovement(*this, afterPrepare.moveStartTime, extrusionStartTime, simMode != SimulationMode::off);
 		if (canClocksNeeded > clocksNeeded)
 		{
 			// Due to rounding error in the calculations, we quite often calculate the CAN move as being longer than our previously-calculated value, normally by just one clock.

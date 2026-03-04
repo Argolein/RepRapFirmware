@@ -343,10 +343,18 @@ public:
 	void SwitchToExpansionMode() noexcept { inExpansionMode = false; }						// we could consider terminating the Move task too
 #endif
 
-	AxisShaper& GetAxisShaper() noexcept { return axisShaper; }
+	GCodeResult ConfigureInputShaping(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);	// process M593 with axis selection
+
+	AxisShaper& GetAxisShaper() noexcept { return axisShaper; }					// legacy/global shaper (used for remotes/extruders)
+	const AxisShaper& GetAxisShaper() const noexcept { return axisShaper; }
+	AxisShaper& GetAxisShaperForAxis(size_t axis) noexcept { return axisShapers[axis]; }
+	const AxisShaper& GetAxisShaperForAxis(size_t axis) const noexcept { return axisShapers[axis]; }
+
+	uint32_t GetPrepareAdvanceTime() const noexcept;
 
 	// Functions called by DDA::Prepare to generate segments for executing DDAs
-	void AddLinearSegments(size_t logicalDrive, uint32_t startTime, const PrepParams& params, motioncalc_t steps, MovementFlags moveFlags, float pressureAdvanceClocks) noexcept;
+	void AddLinearSegments(size_t logicalDrive, uint32_t startTime, const PrepParams& params, motioncalc_t steps, MovementFlags moveFlags, const AxisShaper& shaper,
+						float accelPressureAdvanceClocks, float decelPressureAdvanceClocks, float pressureAdvanceSmoothClocks) noexcept;
 
 	bool AreDrivesStopped(LogicalDrivesBitmap drives) const noexcept;						// return true if none of the drives passed has any movement pending
 
@@ -663,7 +671,8 @@ private:
 
 	float minExtrusionPending = 0.0, maxExtrusionPending = 0.0;
 
-	AxisShaper axisShaper;								// the input shaping that we use for axes - currently just one for all axes
+	AxisShaper axisShapers[MaxAxes];					// per-axis input shaping (X/Y active; others default to none)
+	AxisShaper axisShaper;								// legacy/global input shaping (used for remotes/extruders)
 
 	float specialMoveCoords[MaxDriversPerAxis];			// Amounts by which to move individual Z motors (leadscrew adjustment move)
 

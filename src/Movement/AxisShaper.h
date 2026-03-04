@@ -42,12 +42,13 @@ public:
 	AxisShaper() noexcept;
 
 	// Configure input shaping
-	GCodeResult Configure(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException);	// process M593
+	GCodeResult Configure(GCodeBuffer& gb, const StringRef& reply, bool updateRemote = true) THROWS(GCodeException);	// process M593
 
 	size_t GetNumImpulses() const noexcept { return numImpulses; }
 	motioncalc_t GetImpulseSize(size_t n) const noexcept { return coefficients[n]; }
 	uint32_t GetImpulseDelay(size_t n) const noexcept { return delays[n]; }
 	uint32_t GetPrepareAdvanceTime() const noexcept { return prepareAdvanceTime; }
+	uint32_t GetPhaseAdvanceTime() const noexcept { return phaseAdvanceTime; }
 
 #if SUPPORT_REMOTE_COMMANDS
 	// Handle a request from the master board to set input shaping parameters
@@ -78,6 +79,7 @@ private:
 	unsigned int numImpulses;							// the number of impulses
 	motioncalc_t coefficients[MaxImpulses];				// the coefficients of all the impulses, must add up to 1.0
 	uint32_t delays[MaxImpulses];						// the start delay in step clocks of each impulse, first one is normally zero
+	uint32_t phaseAdvanceTime;							// shift each shaped move earlier by this amount so the shaped output is time-centered
 	uint32_t prepareAdvanceTime;						// how far in advance we need to prepare moves, which depends on input shaping
 };
 

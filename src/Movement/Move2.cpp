@@ -159,9 +159,14 @@ GCodeResult Move::ConfigureMovementQueue(GCodeBuffer& gb, const StringRef& reply
 // Process M572
 GCodeResult Move::ConfigurePressureAdvance(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeException)
 {
-	if (gb.Seen('S'))
+	float advance = 0.0;
+	float smoothTime = 0.0;
+	bool seenAdvance = false;
+	bool seenSmoothTime = false;
+	gb.TryGetNonNegativeFValue('S', advance, seenAdvance);
+	gb.TryGetLimitedFValue('T', smoothTime, seenSmoothTime, 0.0, 0.2);
+	if (seenAdvance || seenSmoothTime)
 	{
-		const float advance = gb.GetNonNegativeFValue();
 		GCodeResult rslt = GCodeResult::ok;
 		ToolNumbersBitmap toolsToUpdate;
 		toolsToUpdate.Clear();
@@ -226,8 +231,20 @@ GCodeResult Move::ConfigurePressureAdvance(GCodeBuffer& gb, const StringRef& rep
 
 			if (!targetAnyTools)
 			{
-				reply.copy("No tool found for specified extruder(s)");
-				return GCodeResult::error;
+				// Legacy fallback: no tool is defined for the specified extruder(s).
+				// Apply PA directly to the extruder shaper so that bare-extruder configs
+				// (M572 D0 S0.05 without a tool) continue to work.
+				// Note: the per-move snapshot system requires an active tool; without one,
+				// local PA is applied via the extruder shaper, and smooth time is ignored.
+				if (seenAdvance)
+				{
+					for (size_t i = 0; i < eCount; ++i)
+					{
+						GetExtruderShaperForExtruder(eDrive[i]).SetKseconds(advance);
+					}
+					reprap.MoveUpdated();
+				}
+				return rslt;
 			}
 
 			for (size_t i = 0; i < eCount; ++i)
@@ -260,17 +277,26 @@ GCodeResult Move::ConfigurePressureAdvance(GCodeBuffer& gb, const StringRef& rep
 					continue;
 				}
 
-				tool->SetPressureAdvance(advance);
+				if (seenAdvance)
+				{
+					tool->SetPressureAdvance(advance);
+				}
+				if (seenSmoothTime)
+				{
+					tool->SetPressureAdvanceSmoothTime(smoothTime);
+				}
+
+				const float paForTool = tool->GetPressureAdvance();
 #if SUPPORT_CAN_EXPANSION
-				tool->IterateExtruders([this, advance](unsigned int extruder)
+				tool->IterateExtruders([this, paForTool](unsigned int extruder)
 										{
-											GetExtruderShaperForExtruder(extruder).SetKseconds(advance);
+											GetExtruderShaperForExtruder(extruder).SetKseconds(paForTool);
 										}
 									);
 #else
-				tool->IterateExtruders([this, advance](unsigned int extruder)
+				tool->IterateExtruders([this, paForTool](unsigned int extruder)
 										{
-											GetExtruderShaperForExtruder(extruder).SetKseconds(advance);
+											GetExtruderShaperForExtruder(extruder).SetKseconds(paForTool);
 										}
 									);
 #endif
@@ -288,7 +314,7 @@ GCodeResult Move::ConfigurePressureAdvance(GCodeBuffer& gb, const StringRef& rep
 	ReadLocker lock(Tool::toolListLock);
 	for (const Tool *_ecv_null tool = Tool::GetToolList(); tool != nullptr; tool = tool->Next())
 	{
-		reply.catf("%c T%d %.4f", c, tool->Number(), (double)tool->GetPressureAdvance());
+		reply.catf("%c T%d %.4f (smooth %.3f)", c, tool->Number(), (double)tool->GetPressureAdvance(), (double)tool->GetPressureAdvanceSmoothTime());
 		c = ',';
 	}
 	return GCodeResult::ok;
@@ -1319,7 +1345,7 @@ void Move::AddMoveFromRemote(const CanMessageMovementLinearShaped& msg) noexcept
 			{
 				EnableDrivers(drive, false);
 				const float pressureAdvanceClocks = (msg.usePressureAdvance) ? msg.pressureAdvanceClocks : 0.0;
-				AddLinearSegments(drive, msg.whenToExecute, params, extrusionRequested, segFlags.AddIsExtruder(), pressureAdvanceClocks);
+				AddLinearSegments(drive, msg.whenToExecute, params, extrusionRequested, segFlags.AddIsExtruder(), GetAxisShaper(), pressureAdvanceClocks, pressureAdvanceClocks, 0.0);
 			}
 		}
 		else
@@ -1328,7 +1354,7 @@ void Move::AddMoveFromRemote(const CanMessageMovementLinearShaped& msg) noexcept
 			if (delta != 0.0)
 			{
 				EnableDrivers(drive, false);
-				AddLinearSegments(drive, msg.whenToExecute, params, delta, segFlags, 0.0);
+				AddLinearSegments(drive, msg.whenToExecute, params, delta, segFlags, GetAxisShaper(), 0.0, 0.0, 0.0);
 			}
 		}
 	}

@@ -15,6 +15,7 @@
 #include <Platform/Platform.h>
 #include <GCodes/GCodes.h>
 #include <Movement/Move.h>
+#include <Movement/MoveTiming.h>
 #include <General/FreelistManager.h>
 
 namespace CanMotion
@@ -47,6 +48,7 @@ namespace CanMotion
 	static Mutex stopListMutex;
 	static uint8_t nextSeq[CanId::MaxCanAddress + 1] = { 0 };
 	static bool warnedNoPaSnapshotSupport[CanId::MaxCanAddress + 1] = { false };
+	static constexpr uint32_t MinCanStartLeadTime = MoveTiming::AbsoluteMinimumPreparedTime;
 
 	static CanMessageBuffer *_ecv_null GetBuffer(const PrepParams& params, DriverId canDriver) noexcept;
 	static bool BoardSupportsMovementPaSnapshot(CanAddress boardAddress) noexcept;
@@ -194,7 +196,7 @@ void CanMotion::AddExtruderMovement(const PrepParams& params, DriverId canDriver
 }
 
 // This is called by DDA::Prepare when all DMs for CAN drives have been processed. Return the calculated move time in steps, or 0 if there are no CAN moves
-uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, bool simulating) noexcept
+uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, uint32_t extruderOnlyStartTime, bool simulating) noexcept
 {
 	uint32_t clocks = 0;
 	if (simulating)
@@ -213,6 +215,21 @@ uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, bool 
 				CanMessageMovementLinearShaped& msg = buf->msg.moveLinearShaped;
 				if (msg.HasMotion())
 				{
+					bool hasAxisMotion = false;
+					for (size_t i = 0; i < msg.numDrivers; ++i)
+					{
+						if ((msg.extruderDrives & (1u << i)) == 0 && msg.perDrive[i].steps != 0)
+						{
+							hasAxisMotion = true;
+							break;
+						}
+					}
+					if (!hasAxisMotion)
+					{
+						// Extruder-only CAN boards cannot follow per-axis X/Y shapers. Disable late shaping for these moves.
+						msg.useLateInputShaping = 0;
+					}
+
 					if (!BoardSupportsMovementPaSnapshot(buf->id.Dst()))
 					{
 						if (!warnedNoPaSnapshotSupport[buf->id.Dst()])
@@ -228,7 +245,18 @@ uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, bool 
 						continue;
 					}
 
-					msg.whenToExecute = moveStartTime;
+					// Keep axis moves on the nominal move start time. For extruder-only moves, shift to the precomputed extrusion phase.
+					uint32_t scheduledStart = (hasAxisMotion) ? moveStartTime : extruderOnlyStartTime;
+					if (!hasAxisMotion)
+					{
+						// Keep a minimum scheduling lead time for CAN transport jitter.
+						const uint32_t earliestSafeStart = StepTimer::GetMovementTimerTicks() + MinCanStartLeadTime;
+						if ((int32_t)(scheduledStart - earliestSafeStart) < 0)
+						{
+							scheduledStart = earliestSafeStart;
+						}
+					}
+					msg.whenToExecute = scheduledStart;
 					uint8_t& seq = nextSeq[buf->id.Dst()];
 					msg.seq = seq;
 					seq = (seq + 1) & 0x7F;
