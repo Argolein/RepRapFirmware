@@ -26,11 +26,14 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
   - Shared-motor kinematics (CoreXY/CoreXZ/etc.) are split into Cartesian X/Y shaping contributions before merge.
 - Phase-centered shaping:
   - Per-axis phase advance is computed from impulse centroid and applied to start-time alignment.
-  - Extruder phase is coupled to weighted X/Y phase advance for better sync with shaped XY motion.
+  - Local extruder phase is coupled to weighted X/Y phase advance for better sync with shaped XY motion.
 - CAN path hardening/compatibility:
   - CAN extruder-only moves keep legacy-safe behavior (no late shaping on remote move frame).
   - Extruder-only CAN scheduling includes minimum lead-time guard for transport jitter.
+  - CAN extruder-only timing is pinned to nominal move start (no weighted XY phase shift) to avoid angle-dependent flow jitter.
   - Capability guard for movement PA snapshot support remains active.
+  - Added capability-negotiated CAN extruder profile v2 path (`movementLinearShapedV2`) with per-phase PA + smooth-time payload.
+  - Legacy fallback remains automatic for non-capable boards and mixed/unsupported cases.
 - Pressure advance improvements (`M572`):
   - Per-tool PA storage and per-move snapshotting.
   - `M572 T<seconds>` added for PA smooth time (seconds, Klipper-compatible unit, range `0.0..0.2`).
@@ -48,10 +51,62 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
   - `DDA.cpp` (`hasRemoteAxisDrivers`): The remote-driver scan now only checks X and Y axes (index 0 and 1). Previously any CAN driver on any axis (e.g. CAN-connected Z) would disable per-axis XY split shaping, even though Z drivers are irrelevant to XY shaping semantics.
 
 ## Current Status
-- Code status: feature-complete for planned scope, with additional safety hardening and code-review fixes applied.
-- Validation status: all fixes compile; hardware re-validation required after this session's changes (see Handoff).
-- Known residual gap vs Klipper: PA smooth-time math is still an approximation in RRF (not full Klipper integral model), especially relevant for remote CAN extrusion timing edge cases.
-- Known minor gap: if PA smooth time exceeds the decel phase duration, the post-segment is skipped and the effective PA contribution is ~75% instead of 100% for that phase end. Acceptable for typical smooth time values (≤0.04 s).
+- Code status: feature-complete for planned scope, including capability-negotiated CAN extruder PA-profile v2 implementation.
+- Validation status: `Duet3Mini5plus`, `FMDC_V03`, and `TOOL1LC` all build clean after v2 changes; on-printer validation pending.
+- Known residual gap vs Klipper: move-level CAN protocol is still descriptor-based (not host step-streaming), so edge-case continuity can still differ from Klipper in pathological segment patterns.
+- Known minor gap: local PA smoothing is now area-conserving under move-boundary clamps, but still uses a compact 3-lobe approximation instead of Klipper's full continuous integral.
+
+## Design Analysis (2026-03-05): Klipper-like Centralized CAN Motion
+### Objective
+- Determine whether Duet 3 Mini 5+ can handle a more Klipper-like architecture where heavy PA/input-shaping math is centralized and the CAN toolboard mainly executes timing-precise step output.
+
+### Hardware/firmware constraints observed in code
+- Mainboard CPU: SAME5x at 120MHz (`../RRF-Build-Helper/rrf-local/deps/CoreN2G/src/Core.h`).
+- Toolboard CPU: SAMC21 at 48MHz (`../RRF-Build-Helper/rrf-local/deps/CoreN2G/src/Core.h`).
+- Duet 3 step clock: 750kHz (`src/RepRapFirmware.h`, `src/Movement/StepTimer.cpp`).
+- CAN link default: 1Mbps, no BRS in current protocol (`../RRF-Build-Helper/rrf-local/deps/CANlib/doc/Duet3CAN-FDProtocol.md`).
+- Motion preparation lead-time: 25ms absolute minimum, 50ms usual (`src/Movement/MoveTiming.h`).
+- Current CAN move frame is per-move (`CanMessageMovementLinearShaped`) with one scalar PA value and optional late shaping flag (`../RRF-Build-Helper/rrf-local/deps/CANlib/src/CanMessageFormats.h`).
+
+### Gap vs Klipper architecture
+- Klipper host precomputes detailed step timing and sends queued step commands (`queue_step`) significantly ahead of execution (`docs/Code_Overview.md` in Klipper repo).
+- Current RRF CAN flow sends compact move descriptors; remote board still computes local segment math.
+- Therefore, behavior can differ most on remote extruder PA smooth-time coupling under rapidly changing XY dynamics.
+
+### Feasibility conclusion
+- Mainboard compute headroom: **sufficient** for centralized PA/input-shaping calculations.
+- Limiting factor is **CAN protocol/bandwidth model**, not raw CPU on Duet 3 Mini 5+.
+- A literal Klipper-style per-step stream over current 1Mbps CAN (without BRS) is high risk for saturation/jitter in worst-case high-step-rate extrusion and is not the recommended path.
+
+### Recommended implementation direction (next step)
+- Introduce a **new CAN extruder motion message (v2)** for extruder-only remote boards:
+  - Keep one-frame-per-move semantics (avoid multi-frame pairing races).
+  - Carry richer per-move extruder compensation profile (beyond single scalar PA).
+  - Leave existing `movementLinearShaped` path unchanged for backward compatibility and mixed-axis remote boards.
+- Add a capability bit in board announce so mainboard can negotiate v2/fallback safely.
+- Mainboard (Mini 5+) computes profile centrally in `DDA::Prepare`.
+- Toolboard (1LC) executes profile deterministically with minimal additional math.
+
+### Why this is preferred
+- Preserves RRF’s deterministic MCU architecture and current safety model.
+- Avoids CAN reordering/association risks from multi-message profile attachment.
+- Keeps CAN traffic bounded and predictable at one motion frame per move.
+- Gives most of Klipper-like quality gain where it matters (remote extruder PA timing) without full protocol rewrite.
+
+### Implementation readiness
+- Mainboard files expected:
+  - `src/Movement/DDA.cpp`
+  - `src/CAN/CanMotion.cpp`
+  - `src/CAN/CanInterface.cpp` (announce capability)
+- Shared protocol:
+  - `../RRF-Build-Helper/rrf-local/deps/CANlib/src/CanMessageFormats.h`
+- Toolboard files expected:
+  - `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion/src/CAN/CanInterface.cpp`
+  - `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion/src/Movement/Move.cpp`
+- Validation plan:
+  - Keep legacy fallback path active.
+  - Add M122 diagnostics counters for v2 usage/fallback.
+  - Re-run PA tower + high-speed perimeter test with CAN extruder and compare against current branch.
 
 ## Implementation status
 - [ ] Not started
@@ -67,7 +122,7 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
 - For CAN extruder-only moves, disable late input shaping in the CAN movement frame and track those extruder segments locally without shaping to avoid flow artefacts when X/Y shapers differ.
 - For shared-motor kinematics (e.g. CoreXY), split each motor move into Cartesian X and Y contributions and apply the corresponding axis shaper to each contribution before segment merge, then reconcile exact motor step totals.
 - Apply a per-axis phase advance (impulse centroid) so shaped motion is time-centred across move boundaries; keep this disabled for axis moves with remote CAN drivers to preserve legacy remote timing semantics.
-- For extruder timing coupling, shift extruder segment start by a direction-weighted XY phase advance and send CAN extruder-only movement frames at that shifted start time to keep PA/extrusion aligned with phase-centred XY motion.
+- For extruder timing coupling, shift local extruder segment start by a direction-weighted XY phase advance for phase-centred alignment; keep CAN extruder-only movement start at nominal move start for timing robustness.
 - Add Klipper-style PA smoothing control via `M572 T<seconds>` (range `0.0..0.2`), stored per tool and snapshotted per move.
 - PA smoothing value is in seconds so Klipper `pressure_advance_smooth_time` values can be transferred directly.
 - `M572` now safely parses combined `S` and `T` in one command (`M572 S... T...`) without parameter-order ambiguity.
@@ -75,38 +130,40 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
 - Safety fix for PA smoothing: do not insert smoothing segments before the move start time; this prevents "Code 3 move error" overlap with already-executing segments.
 - Safety hardening in segment insertion: if a time-shifted segment still requests an overlap with an executing segment, clamp insertion start to executing-segment end instead of halting.
 - PA post-segment boundary: decel PA post-segment is skipped if it would start at or after the move end time, preventing insertion conflicts with the next queued move.
+- PA smoothing boundary handling: pre/post smoothing lobes are clamped to valid in-move start times instead of being dropped, preserving total PA contribution when smooth time exceeds phase/move bounds.
+- CAN extruder profile v2: mainboard sends `movementLinearShapedV2` only when the remote board advertises support; otherwise it falls back to legacy `movementLinearShaped`.
+- `movementLinearShapedV2` stays one-frame-per-move and adds per-phase PA (`accel/decel`) plus smooth-time (in step clocks) while keeping legacy compatibility.
+- Build/version compatibility: keep `TimeSuffix` empty on both mainboard and TOOL1LC firmware builds to avoid false "Incompatible software versions" caused by differing build times.
 - `M572 D<n>` backward compatibility: extruders without a tool fall back to direct extruder-shaper update (legacy path); smooth time (`T`) is ignored in that case.
 - `hasRemoteAxisDrivers` scope: only X and Y axis CAN drivers disable per-axis XY split shaping; other CAN axes (Z, etc.) are irrelevant.
 - Indentation in `GCodes.cpp` `DoStraightMove`/`DoArcMove` PA snapshot block corrected.
 
 ## Handoff
-- Agent: Claude Code (Sonnet 4.6)
-- Date: 2026-03-04
+- Agent: Codex
+- Date: 2026-03-05
 - Completed this session:
-  - Full code review of all branch changes (committed + working tree) against Klipper reference.
-  - Fixed indentation inconsistency in `src/GCodes/GCodes.cpp` (`DoStraightMove` and `DoArcMove` PA snapshot blocks).
-  - Fixed `M572 D<n>` to fall back to direct extruder-shaper update when no tool is defined, restoring backward compatibility for bare-extruder configs.
-  - Fixed `hasRemoteAxisDrivers` in `src/Movement/DDA.cpp` to only scan X and Y axes (was scanning all axes, unnecessarily disabling XY split shaping when e.g. Z was on CAN).
-  - Fixed PA smoothing post-segment in `src/Movement/Move.cpp`: decel post-segment is now skipped if it would start at or after the move end time, preventing insertion into the next move's territory.
-  - Updated `PLANS.md` with all findings, decisions, and open items.
+  - Implemented CAN protocol extension for extruder motion profile v2 (`movementLinearShapedV2`) in CANlib, including announce capability bit.
+  - Implemented capability negotiation and safe fallback on main firmware (`CanMotion`, `ExpansionManager`, announce handling).
+  - Added remote receive/execute support for v2 in both RRF expansion mode and Duet3Expansion (`CommandProcessor`/`Move` paths).
+  - Ported PA smoothing support to Duet3Expansion move segmentation (`accel/decel/smooth` profile) with in-move smoothing clamps and overlap hardening.
+  - Aligned main/toolboard firmware date suffix handling (removed build-time suffix) to prevent false version-mismatch warnings.
+  - Rebuilt main binaries and toolboard binary successfully:
+    - `Duet3Mini5plus/Duet3Firmware_Mini5plus.bin`
+    - `FMDC_V03/Duet3Firmware_FMDC.bin`
+    - `../RRF-Build-Helper/rrf-local/deps/Duet3Expansion/TOOL1LC/Duet3Firmware_TOOL1LC.bin`
 - Stopped at:
-  - Code fixes applied, PLANS.md updated. No rebuild done this session.
+  - Code + build complete; no on-printer validation run in this session.
 - Next step:
-  - Rebuild `Duet3Mini5plus`, `FMDC_V03`, and `TOOL1LC` (all three affected by the DDA.cpp and Move.cpp changes).
-  - Flash and run purge-line + first-layer start test.
-  - Verify: no Code-3 overlap, normal Z-lift, PA and smooth time behave as expected on both local and CAN extruder.
-  - Optional follow-up: improve `M593 X` query reply (currently returns `"X: "` with no config text when type is none — see open items below).
+  - Flash Mini 5+ and TOOL1LC together, then run PA tower + fast line tests to confirm random offset artefacts are resolved with v2 path.
 - Open blockers:
-  - Hardware re-validation required after this session's changes.
+  - Hardware validation pending.
 - Decisions made this session:
-  - `M572 D<n>` without a tool: fall back silently (no error, no warning) to extruder-shaper direct update; smooth time is ignored in fallback path.
-  - `hasRemoteAxisDrivers`: only X and Y axes are checked; Z and higher axes are excluded from the remote-driver guard.
-  - PA post-segment: skip (not clamp) if `postStart >= moveEndTime`; accepted ~75% PA accuracy for decel phases shorter than half the smooth time.
+  - Keep one-frame-per-move CAN semantics and add richer PA profile inside a new movement message type instead of multi-message profile attachment.
+  - Enable v2 only for extruder-only remote moves on boards that explicitly advertise support; fallback to legacy path otherwise.
 
 ## Open items (non-blocking, future sessions)
 - `M593 X` query (no params) returns `"X: "` with empty body when the axis shaper type is `none`. Fix: propagate the current config string from `AxisShaper::Configure` even for the no-params query path, or special-case the empty reply.
 - `M572` report format changed from per-extruder to per-tool; verify DWC parses the new format correctly.
-- `addSegmentWithPressureAdvance` post-segment skipped when smooth time > decel duration: consider redistributing the missing 25% contribution to the main segment as a compensation (low priority).
 - Junction deviation (`M566 P2`): currently uses `min(accel, next->accel)`; could be split per move for closer Klipper fidelity (low priority).
 
 ## Notes

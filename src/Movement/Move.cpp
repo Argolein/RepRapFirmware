@@ -2030,10 +2030,9 @@ void Move::AddLinearSegments(size_t logicalDrive, uint32_t startTime, const Prep
 	const motioncalc_t steadyDistance = (params.steadyClocks == 0) ? (motioncalc_t)0.0 : totalDistance - accelDistance - decelDistance;
 	const bool applyPaSmoothing = moveFlags.isExtruder && !moveFlags.nonPrintingMove && pressureAdvanceSmoothClocks > 0.0;
 	const uint32_t paHalfSmoothingClocks = (applyPaSmoothing) ? (uint32_t)lrintf(pressureAdvanceSmoothClocks * 0.5f) : 0;
-	// The last time at which a PA post-segment may START. Any post-segment starting at or
-	// after this point would lie entirely outside the move and bleed into the next move's
-	// territory, risking segment-insertion conflicts. The accel post-segment extends into
-	// the steady phase of the same move (safe); only the decel post-segment is at risk.
+	// Move end bound used to keep PA smoothing fully inside this move.
+	// We clamp smoothing side lobes to valid start times instead of dropping them,
+	// so total PA contribution stays conserved when smooth time exceeds phase/move bounds.
 	const uint32_t moveEndTime = decelStartTime + params.decelClocks;
 
 	auto addSegmentWithPressureAdvance = [this, &tail, moveFlags, applyPaSmoothing, paHalfSmoothingClocks, startTime, moveEndTime]
@@ -2049,19 +2048,19 @@ void Move::AddLinearSegments(size_t logicalDrive, uint32_t startTime, const Prep
 				}
 				else
 				{
-					const uint32_t preStart = (segStartTime > paHalfSmoothingClocks) ? (segStartTime - paHalfSmoothingClocks) : 0;
+					const uint32_t requestedPreStart = (segStartTime > paHalfSmoothingClocks) ? (segStartTime - paHalfSmoothingClocks) : 0;
 					// Never back-date PA smoothing before this move start, otherwise we may overlap an already-executing segment.
-					const uint32_t safePreStart = max<uint32_t>(preStart, startTime);
+					const uint32_t safePreStart = max<uint32_t>(requestedPreStart, startTime);
+
+					// Keep post smoothing inside this move by clamping to the latest valid start.
+					// If smooth time is large, this may collapse onto the main segment start, which is preferable to dropping PA area.
+					const uint32_t latestValidStart = (segClocks <= moveEndTime) ? (moveEndTime - segClocks) : startTime;
+					const uint32_t requestedPostStart = segStartTime + paHalfSmoothingClocks;
+					const uint32_t safePostStart = min<uint32_t>(requestedPostStart, latestValidStart);
+
 					tail = AddSegment(tail, safePreStart, segClocks, paDistance * (motioncalc_t)0.25, (motioncalc_t)0.0, moveFlags, (motioncalc_t)0.0);
 					tail = AddSegment(tail, segStartTime, segClocks, paDistance * (motioncalc_t)0.5, (motioncalc_t)0.0, moveFlags, (motioncalc_t)0.0);
-					// Only add the post-segment if it starts before the move end.
-					// For the decel phase this avoids inserting a segment that begins
-					// past the move boundary and overlaps the next queued move.
-					const uint32_t postStart = segStartTime + paHalfSmoothingClocks;
-					if (postStart < moveEndTime)
-					{
-						tail = AddSegment(tail, postStart, segClocks, paDistance * (motioncalc_t)0.25, (motioncalc_t)0.0, moveFlags, (motioncalc_t)0.0);
-					}
+					tail = AddSegment(tail, safePostStart, segClocks, paDistance * (motioncalc_t)0.25, (motioncalc_t)0.0, moveFlags, (motioncalc_t)0.0);
 				}
 			}
 		};

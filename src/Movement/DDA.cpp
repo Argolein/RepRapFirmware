@@ -1470,38 +1470,42 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 							const motioncalc_t delta = totalDistance * directionVector[drive] * move.DriveStepsPerMm(drive);
 							const float accelPressureAdvanceClocks = (flags.usePressureAdvance) ? pressureAdvanceClocks : 0.0;
 							const float decelPressureAdvanceClocks = (flags.usePressureAdvance) ? pressureAdvanceClocks : 0.0;
-							float canPressureAdvanceClocks = 0.0;
+							float canAccelPressureAdvanceClocks = 0.0;
+							float canDecelPressureAdvanceClocks = 0.0;
+							float canPressureAdvanceSmoothClocks = 0.0;
 							if (flags.usePressureAdvance)
 							{
-								const float accelSmoothedPa = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.accelClocks);
-								const float decelSmoothedPa = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.decelClocks);
-								const uint32_t paClocks = params.accelClocks + params.decelClocks;
-								if (paClocks != 0)
-								{
-									canPressureAdvanceClocks = ((accelSmoothedPa * (float)params.accelClocks) + (decelSmoothedPa * (float)params.decelClocks))/(float)paClocks;
-								}
+								canAccelPressureAdvanceClocks = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.accelClocks);
+								canDecelPressureAdvanceClocks = GetSmoothedPressureAdvanceClocks(pressureAdvanceClocks, pressureAdvanceSmoothClocks, params.decelClocks);
+								canPressureAdvanceSmoothClocks = pressureAdvanceSmoothClocks;
 							}
 							MovementFlags extruderFlags = segFlags.AddIsExtruder();
+							uint32_t extrusionStartForDrive = extrusionStartTime;
 
 #if SUPPORT_CAN_EXPANSION
 							const DriverId driver = move.GetExtruderDriver(extruder);
-							if (driver.IsRemote())
+							const bool isRemoteExtruder = driver.IsRemote();
+							if (isRemoteExtruder)
 							{
 								// A remote tool board has a single legacy shaper, which cannot track per-axis X/Y shaping on the main board.
 								// Keep remote extruder motion unshaped to avoid flow modulation artefacts.
 								extruderFlags.noShaping = true;
+								// Keep CAN extruder-only timing on the nominal move start.
+								// Phase-shifting remote extrusion by weighted XY shaper centroid can amplify transport jitter into visible flow artefacts.
+								extrusionStartForDrive = afterPrepare.moveStartTime;
 							}
 #endif
 
 							// We generate segments even for nonlocal extruders in order to track extruder position
-							move.AddLinearSegments(drive, extrusionStartTime, params, delta, extruderFlags, move.GetAxisShaper(),
+							move.AddLinearSegments(drive, extrusionStartForDrive, params, delta, extruderFlags, move.GetAxisShaper(),
 													accelPressureAdvanceClocks, decelPressureAdvanceClocks, pressureAdvanceSmoothClocks);
 
 #if SUPPORT_CAN_EXPANSION
-							if (driver.IsRemote())
+							if (isRemoteExtruder)
 							{
-								// The MovementLinearShaped message requires the extrusion amount in steps to be passed as a float. The remote board adds the PA and handles fractional steps.
-								CanMotion::AddExtruderMovement(params, driver, delta, canPressureAdvanceClocks);
+								// CAN movement messages pass extrusion amount in steps as a float.
+								// Legacy path uses a single averaged PA value; v2-capable remotes also receive per-phase PA + smooth-time.
+								CanMotion::AddExtruderMovement(params, driver, delta, canAccelPressureAdvanceClocks, canDecelPressureAdvanceClocks, canPressureAdvanceSmoothClocks);
 							}
 #endif
 							afterPrepare.drivesMoving.SetBit(drive);
@@ -1540,7 +1544,7 @@ void DDA::Prepare(DDARing& ring, uint32_t prepareAdvanceTime, SimulationMode sim
 		}
 
 #if SUPPORT_CAN_EXPANSION
-			const uint32_t canClocksNeeded = CanMotion::FinishMovement(*this, afterPrepare.moveStartTime, extrusionStartTime, simMode != SimulationMode::off);
+			const uint32_t canClocksNeeded = CanMotion::FinishMovement(*this, afterPrepare.moveStartTime, afterPrepare.moveStartTime, simMode != SimulationMode::off);
 		if (canClocksNeeded > clocksNeeded)
 		{
 			// Due to rounding error in the calculations, we quite often calculate the CAN move as being longer than our previously-calculated value, normally by just one clock.

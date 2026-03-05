@@ -385,6 +385,63 @@ void CommandProcessor::ProcessReceivedMessage(CanMessageBuffer *buf) noexcept
 				}
 				return;							// no reply needed
 
+				case CanMessageType::movementLinearShapedV2:
+					{
+						const CanMessageMovementLinearShapedV2& msg = buf->msg.moveLinearShapedV2;
+						const size_t minLength = sizeof(msg) - sizeof(msg.perDrive);
+						const size_t expectedLength = minLength + (size_t)msg.numDrivers * sizeof(msg.perDrive[0]);
+						if (msg.numDrivers == 0 || msg.numDrivers > CanMessageMovementLinearShapedV2::MaxV2Drivers || buf->dataLength < expectedLength)
+						{
+							++oosMessagesOther;
+							CanInterface::LogIgnoredMovementMessage();
+							return;
+						}
+					}
+
+					// Check for duplicate and out-of-sequence message.
+					{
+					const int8_t seq = buf->msg.moveLinearShapedV2.seq;
+					if (((seq + 1) & CanMessageMovementLinearShapedV2::SeqMask) == expectedSeq)
+					{
+						++duplicateMotionMessages;
+						return;
+					}
+
+					if (seq != expectedSeq && expectedSeq != 0xFF)
+					{
+						switch ((seq - expectedSeq) & CanMessageMovementLinearShapedV2::SeqMask)
+						{
+						case 1:
+							++oosMessages1Ahead;
+							break;
+
+						case 2:
+							++oosMessages2Ahead;
+							break;
+
+						case 0x7E:
+							++oosMessages2Behind;
+							break;
+
+						default:
+							++oosMessagesOther;
+							break;
+						}
+					}
+
+					expectedSeq = (seq + 1) & CanMessageMovementLinearShapedV2::SeqMask;
+				}
+
+				if (StepTimer::IsSynced())
+				{
+					reprap.GetMove().AddMoveFromRemote(buf->msg.moveLinearShapedV2);
+				}
+				else
+				{
+					CanInterface::LogIgnoredMovementMessage();
+				}
+				return;							// no reply needed
+
 			case CanMessageType::stopMovement:
 				reprap.GetMove().StopDriversFromRemote(buf->msg.stopMovement.whichDrives);
 				return;							// no reply needed

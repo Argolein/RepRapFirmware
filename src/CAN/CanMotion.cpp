@@ -17,6 +17,7 @@
 #include <Movement/Move.h>
 #include <Movement/MoveTiming.h>
 #include <General/FreelistManager.h>
+#include <cmath>
 
 namespace CanMotion
 {
@@ -48,10 +49,23 @@ namespace CanMotion
 	static Mutex stopListMutex;
 	static uint8_t nextSeq[CanId::MaxCanAddress + 1] = { 0 };
 	static bool warnedNoPaSnapshotSupport[CanId::MaxCanAddress + 1] = { false };
+	static bool warnedPaProfileFallback[CanId::MaxCanAddress + 1] = { false };
 	static constexpr uint32_t MinCanStartLeadTime = MoveTiming::AbsoluteMinimumPreparedTime;
+
+	struct RemotePaProfile
+	{
+		float accelPressureAdvanceClocks;
+		float decelPressureAdvanceClocks;
+		float pressureAdvanceSmoothClocks;
+		bool seen;
+		bool consistent;
+	};
+
+	static RemotePaProfile remotePaProfiles[CanId::MaxCanAddress + 1];
 
 	static CanMessageBuffer *_ecv_null GetBuffer(const PrepParams& params, DriverId canDriver) noexcept;
 	static bool BoardSupportsMovementPaSnapshot(CanAddress boardAddress) noexcept;
+	static bool BoardSupportsMovementLinearShapedV2(CanAddress boardAddress) noexcept;
 	static void FreeMovementBuffers() noexcept;
 }
 
@@ -85,6 +99,16 @@ bool CanMotion::BoardSupportsMovementPaSnapshot(CanAddress boardAddress) noexcep
 	return boardData->supportsMovementPaSnapshot;
 }
 
+bool CanMotion::BoardSupportsMovementLinearShapedV2(CanAddress boardAddress) noexcept
+{
+	const ExpansionBoardData *const boardData = reprap.GetExpansion().GetBoardDetails(boardAddress);
+	if (boardData == nullptr)
+	{
+		return false;
+	}
+	return boardData->supportsMovementLinearShapedV2;
+}
+
 // This is called by DDA::Prepare at the start of preparing a movement
 void CanMotion::StartMovement() noexcept
 {
@@ -103,6 +127,15 @@ void CanMotion::StartMovement() noexcept
 		}
 		stopList = p->next;
 		delete p;
+	}
+
+	for (RemotePaProfile& paProfile : remotePaProfiles)
+	{
+		paProfile.accelPressureAdvanceClocks = 0.0;
+		paProfile.decelPressureAdvanceClocks = 0.0;
+		paProfile.pressureAdvanceSmoothClocks = 0.0;
+		paProfile.seen = false;
+		paProfile.consistent = true;
 	}
 }
 
@@ -183,15 +216,44 @@ void CanMotion::AddAxisMovement(const PrepParams& params, DriverId canDriver, in
 	}
 }
 
-void CanMotion::AddExtruderMovement(const PrepParams& params, DriverId canDriver, float extrusion, float pressureAdvanceClocks) noexcept
+void CanMotion::AddExtruderMovement(const PrepParams& params, DriverId canDriver, float extrusion, float accelPressureAdvanceClocks,
+									float decelPressureAdvanceClocks, float pressureAdvanceSmoothClocks) noexcept
 {
 	CanMessageBuffer * const buf = GetBuffer(params, canDriver);
 	if (buf != nullptr)
 	{
 		buf->msg.moveLinearShaped.perDrive[canDriver.localDriver].extrusion = extrusion;
 		buf->msg.moveLinearShaped.extruderDrives |= 1u << canDriver.localDriver;
-		buf->msg.moveLinearShaped.usePressureAdvance = (pressureAdvanceClocks > 0.0);
-		buf->msg.moveLinearShaped.pressureAdvanceClocks = pressureAdvanceClocks;
+
+		// Legacy movementLinearShaped carries just one PA value. Keep filling it for fallback.
+		const uint32_t totalPaClocks = params.accelClocks + params.decelClocks;
+		float averagePressureAdvanceClocks = 0.0;
+		if (totalPaClocks != 0)
+		{
+			averagePressureAdvanceClocks =
+					((accelPressureAdvanceClocks * (float)params.accelClocks) + (decelPressureAdvanceClocks * (float)params.decelClocks))/(float)totalPaClocks;
+		}
+		buf->msg.moveLinearShaped.usePressureAdvance = (averagePressureAdvanceClocks > 0.0);
+		buf->msg.moveLinearShaped.pressureAdvanceClocks = averagePressureAdvanceClocks;
+
+		// Record per-board rich PA profile for movementLinearShapedV2-capable remotes.
+		RemotePaProfile& paProfile = remotePaProfiles[canDriver.boardAddress];
+		if (!paProfile.seen)
+		{
+			paProfile.accelPressureAdvanceClocks = accelPressureAdvanceClocks;
+			paProfile.decelPressureAdvanceClocks = decelPressureAdvanceClocks;
+			paProfile.pressureAdvanceSmoothClocks = pressureAdvanceSmoothClocks;
+			paProfile.seen = true;
+			paProfile.consistent = true;
+		}
+		else
+		{
+			const bool sameProfile =
+					fabsf(paProfile.accelPressureAdvanceClocks - accelPressureAdvanceClocks) <= 1.0e-6f
+				 && fabsf(paProfile.decelPressureAdvanceClocks - decelPressureAdvanceClocks) <= 1.0e-6f
+				 && fabsf(paProfile.pressureAdvanceSmoothClocks - pressureAdvanceSmoothClocks) <= 1.0e-6f;
+			paProfile.consistent = paProfile.consistent && sameProfile;
+		}
 	}
 }
 
@@ -215,29 +277,26 @@ uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, uint3
 				CanMessageMovementLinearShaped& msg = buf->msg.moveLinearShaped;
 				if (msg.HasMotion())
 				{
+					const CanAddress dstAddress = buf->id.Dst();
+					const CanMessageMovementLinearShaped legacyMsg = msg;
 					bool hasAxisMotion = false;
-					for (size_t i = 0; i < msg.numDrivers; ++i)
+					for (size_t i = 0; i < legacyMsg.numDrivers; ++i)
 					{
-						if ((msg.extruderDrives & (1u << i)) == 0 && msg.perDrive[i].steps != 0)
+						if ((legacyMsg.extruderDrives & (1u << i)) == 0 && legacyMsg.perDrive[i].steps != 0)
 						{
 							hasAxisMotion = true;
 							break;
 						}
 					}
-					if (!hasAxisMotion)
-					{
-						// Extruder-only CAN boards cannot follow per-axis X/Y shapers. Disable late shaping for these moves.
-						msg.useLateInputShaping = 0;
-					}
 
-					if (!BoardSupportsMovementPaSnapshot(buf->id.Dst()))
+					if (!BoardSupportsMovementPaSnapshot(dstAddress))
 					{
-						if (!warnedNoPaSnapshotSupport[buf->id.Dst()])
+						if (!warnedNoPaSnapshotSupport[dstAddress])
 						{
-							warnedNoPaSnapshotSupport[buf->id.Dst()] = true;
+							warnedNoPaSnapshotSupport[dstAddress] = true;
 							reprap.GetPlatform().MessageF(ErrorMessage,
 								"CAN board %u is missing movement PA snapshot support; flash matching firmware on all boards\n",
-								buf->id.Dst());
+								dstAddress);
 						}
 						reprap.EmergencyStop();
 						CanMessageBuffer::Free(buf);
@@ -256,20 +315,72 @@ uint32_t CanMotion::FinishMovement(const DDA& dda, uint32_t moveStartTime, uint3
 							scheduledStart = earliestSafeStart;
 						}
 					}
-					msg.whenToExecute = scheduledStart;
-					uint8_t& seq = nextSeq[buf->id.Dst()];
-					msg.seq = seq;
+					uint8_t& seq = nextSeq[dstAddress];
+					const uint8_t thisSeq = seq;
 					seq = (seq + 1) & 0x7F;
-					buf->dataLength = msg.GetActualDataLength();
+
+					bool sentV2 = false;
+					if (!hasAxisMotion && BoardSupportsMovementLinearShapedV2(dstAddress))
+					{
+						const RemotePaProfile& paProfile = remotePaProfiles[dstAddress];
+						const bool canUseV2Profile = paProfile.seen
+												  && paProfile.consistent
+												  && legacyMsg.numDrivers <= CanMessageMovementLinearShapedV2::MaxV2Drivers;
+						if (canUseV2Profile)
+						{
+							auto * const msgV2 = buf->SetupRequestMessageNoRid<CanMessageMovementLinearShapedV2>(CanInterface::GetCurrentMasterAddress(), dstAddress);
+							msgV2->whenToExecute = scheduledStart;
+							msgV2->accelerationClocks = legacyMsg.accelerationClocks;
+							msgV2->steadyClocks = legacyMsg.steadyClocks;
+							msgV2->decelClocks = legacyMsg.decelClocks;
+							msgV2->extruderDrives = legacyMsg.extruderDrives;
+							msgV2->numDrivers = legacyMsg.numDrivers;
+							msgV2->seq = thisSeq;
+							msgV2->zero1 = msgV2->zero2 = 0;
+							msgV2->usePressureAdvance = legacyMsg.usePressureAdvance;
+							msgV2->useLateInputShaping = 0;						// extruder-only remotes use no late XY shaping
+							msgV2->acceleration = legacyMsg.acceleration;
+							msgV2->deceleration = legacyMsg.deceleration;
+							msgV2->accelPressureAdvanceClocks = paProfile.accelPressureAdvanceClocks;
+							msgV2->decelPressureAdvanceClocks = paProfile.decelPressureAdvanceClocks;
+							msgV2->pressureAdvanceSmoothClocks = paProfile.pressureAdvanceSmoothClocks;
+							for (size_t i = 0; i < msgV2->numDrivers; ++i)
+							{
+								msgV2->perDrive[i].steps = legacyMsg.perDrive[i].steps;
+							}
+							buf->dataLength = msgV2->GetActualDataLength();
+							sentV2 = true;
+						}
+						else if (!warnedPaProfileFallback[dstAddress])
+						{
+							warnedPaProfileFallback[dstAddress] = true;
+							reprap.GetPlatform().MessageF(WarningMessage,
+								"CAN board %u falling back to legacy movement profile for this move\n",
+								dstAddress);
+						}
+					}
+
+					if (!sentV2)
+					{
+						msg.whenToExecute = scheduledStart;
+						msg.seq = thisSeq;
+						if (!hasAxisMotion)
+						{
+							// Extruder-only CAN boards cannot follow per-axis X/Y shapers. Disable late shaping for these moves.
+							msg.useLateInputShaping = 0;
+						}
+						buf->dataLength = msg.GetActualDataLength();
+					}
+
 					if (dda.IsCheckingEndstops())
 					{
 						// Set up the stop list
-						DriversStopList * const sl = new DriversStopList(stopList, buf->id.Dst());
-						const size_t nd = msg.numDrivers;
+						DriversStopList * const sl = new DriversStopList(stopList, dstAddress);
+						const size_t nd = legacyMsg.numDrivers;
 						sl->numDrivers = (uint8_t)nd;
 						for (size_t i = 0; i < nd; ++i)
 						{
-							sl->stopStates[i] = (msg.perDrive[i].steps != 0) ? DriverStopState::active : DriverStopState::inactive;
+							sl->stopStates[i] = (legacyMsg.perDrive[i].steps != 0) ? DriverStopState::active : DriverStopState::inactive;
 						}
 						stopList = sl;
 					}

@@ -329,6 +329,7 @@ public:
 	void SendDriversStatus(CanMessageBuffer& buf) noexcept;
 
 	void AddMoveFromRemote(const CanMessageMovementLinearShaped& msg) noexcept;				// add a move to the movement queue when we are in expansion board mode
+	void AddMoveFromRemote(const CanMessageMovementLinearShapedV2& msg) noexcept;				// add a v2 move to the movement queue when we are in expansion board mode
 	void StopDriversFromRemote(uint16_t whichDrives) noexcept;
 	void RevertPosition(const CanMessageRevertPosition& msg) noexcept;
 
