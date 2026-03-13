@@ -743,28 +743,6 @@ bool DDA::IsAccelerationMove() const noexcept
 {
 //	if (reprap.Debug(moduleDda)) debugPrintf("Adjusting, %f\n", laDDA->targetNextSpeed);
 	unsigned int laDepth = 0;
-	const float mcrAccelFactor = max<float>(1.0 - reprap.GetMove().GetMinimumCruiseRatio(), 0.0);
-	const auto LimitTargetSpeedForMcr = [mcrAccelFactor](DDA *dda) noexcept
-	{
-		// Keep Klipper-like minimum-cruise behaviour scoped to XY kinematic moves.
-		if (!dda->flags.xyMoving || !dda->next->flags.xyMoving || mcrAccelFactor >= 1.0)
-		{
-			return;
-		}
-
-		const float pseudoAcceleration = dda->maxAcceleration * mcrAccelFactor;
-		if (pseudoAcceleration <= 0.0)
-		{
-			dda->beforePrepare.targetNextSpeed = min<float>(dda->beforePrepare.targetNextSpeed, dda->startSpeed);
-			return;
-		}
-
-		const float maxMcrReachableSpeed = fastSqrtf(fsquare(dda->startSpeed) + (2 * pseudoAcceleration * dda->totalDistance));
-		if (dda->beforePrepare.targetNextSpeed > maxMcrReachableSpeed)
-		{
-			dda->beforePrepare.targetNextSpeed = maxMcrReachableSpeed;
-		}
-	};
 
 	// Iterate through the list towards earlier moves
 	for (;;)
@@ -774,7 +752,6 @@ bool DDA::IsAccelerationMove() const noexcept
 		{
 			laDDA->beforePrepare.targetNextSpeed = laDDA->requestedSpeed;			// don't try for an end speed higher than our requested speed
 		}
-		LimitTargetSpeedForMcr(laDDA);
 		if (laDDA->topSpeed >= laDDA->requestedSpeed)
 		{
 			// This move already reaches its top speed, so we just need to adjust the deceleration part
@@ -798,14 +775,6 @@ bool DDA::IsAccelerationMove() const noexcept
 				{
 					laDDA->MatchSpeeds();
 					float maxStartSpeed = fastSqrtf(fsquare(laDDA->beforePrepare.targetNextSpeed) + (2 * laDDA->maxDeceleration * laDDA->totalDistance));
-					if (mcrAccelFactor < 1.0 && laDDA->prev->flags.xyMoving && laDDA->flags.xyMoving)
-					{
-						const float pseudoDeceleration = laDDA->maxDeceleration * mcrAccelFactor;
-						const float mcrStartSpeed = (pseudoDeceleration <= 0.0)
-														? laDDA->beforePrepare.targetNextSpeed
-														: fastSqrtf(fsquare(laDDA->beforePrepare.targetNextSpeed) + (2 * pseudoDeceleration * laDDA->totalDistance));
-						maxStartSpeed = min<float>(maxStartSpeed, mcrStartSpeed);
-					}
 					laDDA->prev->beforePrepare.targetNextSpeed = min<float>(maxStartSpeed, laDDA->requestedSpeed);
 
 					// Still going up
@@ -828,7 +797,6 @@ bool DDA::IsAccelerationMove() const noexcept
 		{
 			laDDA->beforePrepare.targetNextSpeed = maxReachableSpeed;
 		}
-		LimitTargetSpeedForMcr(laDDA);
 		break;
 	}
 
@@ -882,7 +850,6 @@ LA_DEBUG;
 		{
 			laDDA->beforePrepare.targetNextSpeed = maxEndSpeed;
 		}
-		LimitTargetSpeedForMcr(laDDA);
 	}
 }
 

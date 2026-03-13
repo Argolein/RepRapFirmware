@@ -362,7 +362,7 @@ void CommandProcessor::ProcessReceivedMessage(CanMessageBuffer *buf) noexcept
 							++oosMessages2Ahead;
 							break;
 
-						case 0x7E:
+						case 0x0E:
 							++oosMessages2Behind;
 							break;
 
@@ -419,7 +419,7 @@ void CommandProcessor::ProcessReceivedMessage(CanMessageBuffer *buf) noexcept
 							++oosMessages2Ahead;
 							break;
 
-						case 0x7E:
+						case 0x0E:
 							++oosMessages2Behind;
 							break;
 

@@ -34,6 +34,7 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
   - Capability guard for movement PA snapshot support remains active.
   - Added capability-negotiated CAN extruder profile v2 path (`movementLinearShapedV2`) with per-phase PA + smooth-time payload.
   - Legacy fallback remains automatic for non-capable boards and mixed/unsupported cases.
+  - Fixed CAN movement OOS diagnostics for 4-bit motion sequence IDs (`SeqMask=0x0f`): "2-behind" now matches `0x0E` (was stale `0x7E` from 7-bit logic).
 - Pressure advance improvements (`M572`):
   - Per-tool PA storage and per-move snapshotting.
   - `M572 T<seconds>` added for PA smooth time (seconds, Klipper-compatible unit, range `0.0..0.2`).
@@ -41,6 +42,7 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
 - Lookahead/cruise improvements (`M566 R`):
   - Added Klipper-like minimum cruise ratio parameter `R` to `M566` (range `0.00..0.99`, default `0.50`).
   - Planner integration in both `DDA::DoLookahead` and `DDA::RecalculateMove` to limit excessive accel/decel-only phases and preserve a minimum cruise portion on XY moves.
+  - Follow-up tuning: removed duplicate MCR clamping from `DDA::DoLookahead` and kept a single enforcement point in `DDA::RecalculateMove` to avoid over-constraining travel moves.
 - Crash prevention fixes for segment overlap:
   - PA smoothing pre-segment cannot start before move start.
   - If a time-shifted segment still overlaps an executing segment, insertion is clamped to executing segment end (no emergency halt).
@@ -127,6 +129,7 @@ Port Klipper-style per-axis input shaping (resonance compensation) to RepRapFirm
 - PA smoothing value is in seconds so Klipper `pressure_advance_smooth_time` values can be transferred directly.
 - `M572` now safely parses combined `S` and `T` in one command (`M572 S... T...`) without parameter-order ambiguity.
 - `M566 R` introduces minimum cruise ratio control with Klipper-compatible semantics (default `0.50`), scoped to XY lookahead/recalculation where it improves print quality most.
+- `M566 R` enforcement was refined to a single clamp site (`DDA::RecalculateMove`) after observing travel moves being over-limited by duplicate lookahead + recalc clamping.
 - Safety fix for PA smoothing: do not insert smoothing segments before the move start time; this prevents "Code 3 move error" overlap with already-executing segments.
 - Safety hardening in segment insertion: if a time-shifted segment still requests an overlap with an executing segment, clamp insertion start to executing-segment end instead of halting.
 - PA post-segment boundary: decel PA post-segment is skipped if it would start at or after the move end time, preventing insertion conflicts with the next queued move.
